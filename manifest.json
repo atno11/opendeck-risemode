@@ -1,0 +1,17 @@
+{
+  "Name": "RISE MODE Stream Deck",
+  "Description": "OpenDeck support for RISE MODE Stream Deck controllers",
+  "Author": "OpenDeck RISE MODE contributors",
+  "Version": "0.1.0",
+  "PluginUUID": "dev.atno.plugins.opendeck-risemode",
+  "CodePathWin": "opendeck-risemode.exe",
+  "Icon": "assets/icon",
+  "Category": "Hardware",
+  "OS": [
+    {
+      "Platform": "windows"
+    }
+  ],
+  "Actions": [],
+  "DeviceNamespace": "A6"
+}
