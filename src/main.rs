@@ -54,7 +54,7 @@ const OPENDECK_TO_PHYSICAL: [u8; KEY_COUNT] = [
     13, 10, 7, 4, 1, 16, 14, 11, 8, 5, 2, 17, 15, 12, 9, 6, 3, 18,
 ];
 
-// Tested initialization reports.
+// Previously validated initialization reports.
 // The first byte is the HID Report ID.
 const CRT_DIS: [u8; 9] = [0x00, 0x43, 0x52, 0x54, 0x00, 0x00, 0x44, 0x49, 0x53];
 
@@ -62,17 +62,26 @@ const CRT_LIG: [u8; 13] = [
     0x00, 0x43, 0x52, 0x54, 0x00, 0x00, 0x4C, 0x49, 0x47, 0x00, 0x00, 0x00, 0x00,
 ];
 
+// Exact report from the successful single-command probe.
+//
+// Although the key field is 7, the RISE MODE Vision 01
+// was observed to clear all 18 key displays.
+//
+// Never substitute 0xFF here without separate validation.
+// This command is sent only once per device connection.
+const CRT_CLE_OBSERVED_GLOBAL: [u8; 13] = [
+    0x00, 0x43, 0x52, 0x54, 0x00, 0x00, 0x43, 0x4C, 0x45, 0x00, 0x00, 0x00, 0x07,
+];
+
 struct ImageUpdate {
     physical_key: u8,
     jpeg: Vec<u8>,
 }
 
-// Only one tested control interface is supported.
 static IMAGE_SENDER: LazyLock<Mutex<Option<mpsc::Sender<ImageUpdate>>>> =
     LazyLock::new(|| Mutex::new(None));
 
-// Ensure that a writer task is stopped if the device task
-// is cancelled during a physical disconnection.
+// Abort the HID writer when its device task is cancelled.
 struct AbortOnDrop(JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -82,9 +91,8 @@ impl Drop for AbortOnDrop {
 }
 
 fn encode_jpeg_96(image: DynamicImage) -> Result<Vec<u8>, String> {
-    // Match the effective AKP153 image orientation:
-    // Rot90 + horizontal/vertical mirroring = Rot270.
-    // No additional HID operation is required.
+    // Effective AKP153 orientation:
+    // Rot90 + both-axis mirroring = Rot270.
     let resized = image
         .resize_exact(IMAGE_SIZE, IMAGE_SIZE, FilterType::Lanczos3)
         .rotate270()
@@ -107,7 +115,6 @@ fn prepare_jpeg(data: &str) -> Result<Vec<u8>, String> {
     let url =
         DataUrl::process(data).map_err(|error| format!("Invalid image data URL: {error:?}"))?;
 
-    // Match the JPEG input contract used by AKP153.
     if url.mime_type().subtype != "jpeg" {
         return Err(format!("Unsupported image MIME type: {}", url.mime_type()));
     }
@@ -122,7 +129,56 @@ fn prepare_jpeg(data: &str) -> Result<Vec<u8>, String> {
     encode_jpeg_96(image)
 }
 
-// Build only the already tested image protocol:
+// Black JPEG uses the same validated image encoder.
+fn black_jpeg() -> Result<Vec<u8>, String> {
+    encode_jpeg_96(DynamicImage::new_rgb8(IMAGE_SIZE, IMAGE_SIZE))
+}
+
+// Queue one image for one OpenDeck position.
+async fn queue_image_for_position(
+    sender: &mpsc::Sender<ImageUpdate>,
+    position: u8,
+    jpeg: Vec<u8>,
+) -> Result<(), String> {
+    let physical_key = OPENDECK_TO_PHYSICAL
+        .get(position as usize)
+        .copied()
+        .ok_or_else(|| format!("Invalid OpenDeck key position: {position}"))?;
+
+    log::info!(
+        "Queueing image: OpenDeck {} -> physical {}, {} bytes",
+        position,
+        physical_key,
+        jpeg.len()
+    );
+
+    sender
+        .send(ImageUpdate { physical_key, jpeg })
+        .await
+        .map_err(|_| "Image queue unavailable".to_string())
+}
+
+// Preserve the previously validated JPEG blanking method.
+// Used during initialization and for clear-all requests.
+async fn queue_blank_all(sender: &mpsc::Sender<ImageUpdate>) -> Result<(), String> {
+    let jpeg = black_jpeg()?;
+
+    for physical_key in OPENDECK_TO_PHYSICAL {
+        sender
+            .send(ImageUpdate {
+                physical_key,
+                jpeg: jpeg.clone(),
+            })
+            .await
+            .map_err(|_| "Image queue unavailable".to_string())?;
+    }
+
+    log::info!("Queued black images for all {KEY_COUNT} keys");
+
+    Ok(())
+}
+
+// Only the previously tested image protocol:
 // CRT BAT -> JPEG payload -> CRT STP.
 fn make_image_reports(
     physical_key: u8,
@@ -138,7 +194,7 @@ fn make_image_reports(
 
     let mut reports = Vec::with_capacity(2 + jpeg.len().div_ceil(OUTPUT_PAYLOAD_BYTES));
 
-    // CRT BAT header.
+    // CRT BAT.
     let mut report = [0u8; OUTPUT_REPORT_BYTES];
 
     report[1..9].copy_from_slice(b"CRT\0\0BAT");
@@ -148,8 +204,7 @@ fn make_image_reports(
 
     reports.push(report);
 
-    // 1 Report ID byte + 1024 JPEG bytes.
-    // The final packet is padded with zeroes.
+    // JPEG: 1024 payload bytes per HID report.
     for chunk in jpeg.chunks(OUTPUT_PAYLOAD_BYTES) {
         let mut report = [0u8; OUTPUT_REPORT_BYTES];
 
@@ -158,7 +213,7 @@ fn make_image_reports(
         reports.push(report);
     }
 
-    // CRT STP terminates the transfer.
+    // CRT STP.
     let mut report = [0u8; OUTPUT_REPORT_BYTES];
 
     report[1..9].copy_from_slice(b"CRT\0\0STP");
@@ -196,41 +251,45 @@ impl openaction::GlobalEventHandler for PluginEvents {
             return Ok(());
         }
 
-        // Stage 1 handles image assignment and replacement.
-        // Image clearing will be handled separately.
-        let (Some(position), Some(image)) = (event.position, event.image) else {
-            return Ok(());
-        };
-
-        let Some(&physical_key) = OPENDECK_TO_PHYSICAL.get(position as usize) else {
-            log::warn!("Invalid OpenDeck key position: {position}");
-            return Ok(());
-        };
-
         let sender = IMAGE_SENDER.lock().await.clone();
 
         let Some(sender) = sender else {
-            log::warn!("Image received without active device");
+            log::warn!("Image event received without active device");
             return Ok(());
         };
 
-        let jpeg = match prepare_jpeg(&image) {
-            Ok(jpeg) => jpeg,
-            Err(error) => {
-                log::error!("Image preparation failed: {error}");
-                return Ok(());
+        // OpenDeck image event contract:
+        // (Some position, Some image) = assign/replace
+        // (Some position, None)       = clear one key
+        // (None, None)                = clear all keys
+        let result = match (event.position, event.image) {
+            (Some(position), Some(image)) => match prepare_jpeg(&image) {
+                Ok(jpeg) => queue_image_for_position(&sender, position, jpeg).await,
+                Err(error) => Err(error),
+            },
+
+            (Some(position), None) => {
+                log::info!("Clearing OpenDeck key {position}");
+
+                match black_jpeg() {
+                    Ok(jpeg) => queue_image_for_position(&sender, position, jpeg).await,
+                    Err(error) => Err(error),
+                }
+            }
+
+            (None, None) => {
+                log::info!("OpenDeck requested all images cleared");
+                queue_blank_all(&sender).await
+            }
+
+            (None, Some(_)) => {
+                log::warn!("Ignoring image without a key position");
+                Ok(())
             }
         };
 
-        log::info!(
-            "Queueing image: OpenDeck {} -> physical {}, {} bytes",
-            position,
-            physical_key,
-            jpeg.len()
-        );
-
-        if let Err(error) = sender.send(ImageUpdate { physical_key, jpeg }).await {
-            log::error!("Image queue unavailable: {error}");
+        if let Err(error) = result {
+            log::error!("Image event failed: {error}");
         }
 
         Ok(())
@@ -286,7 +345,7 @@ async fn read_device(info: DeviceInfo) {
 
     log::info!("HID interface opened");
 
-    // Preserve the two proven initialization reports.
+    // Preserve the two validated initialization reports.
     let mut report = [0u8; OUTPUT_REPORT_BYTES];
 
     report[..CRT_DIS.len()].copy_from_slice(&CRT_DIS);
@@ -311,10 +370,35 @@ async fn read_device(info: DeviceInfo) {
     }
 
     log::info!("CRT LIG submitted");
+
+    // New: native display clearing at connection startup.
+    //
+    // The exact report was tested independently.
+    // On this hardware it cleared all 18 key displays
+    // despite containing physical key 7.
+    //
+    // Submit it once, before any JPEG transfers.
+    // No separate CRT STP is sent for this command.
+    report.fill(0);
+    report[..CRT_CLE_OBSERVED_GLOBAL.len()].copy_from_slice(&CRT_CLE_OBSERVED_GLOBAL);
+
+    log::info!("Sending CRT CLE (observed global clear)");
+
+    match writer.write_output_report(&report).await {
+        Ok(_) => {
+            log::info!("CRT CLE submitted");
+        }
+        Err(error) => {
+            // Keep device registration and button input available
+            // if native clearing cannot be submitted.
+            // The previously tested black JPEG fallback follows.
+            log::warn!("CRT CLE failed, continuing with JPEG fallback: {error}");
+        }
+    }
+
     log::info!("RISE MODE initialization submitted");
 
-    // Register the controller using the previously
-    // validated identity, dimensions and device ID.
+    // Register with the previously validated identity.
     {
         let mut manager = OUTBOUND_EVENT_MANAGER.lock().await;
 
@@ -341,8 +425,8 @@ async fn read_device(info: DeviceInfo) {
 
     log::info!("RISE MODE registered in OpenDeck");
 
-    // The writer owns the same HID write handle initialized above.
-    // Reading physical keys remains in this device task.
+    // The writer owns the same HID write handle.
+    // Button input remains independent below.
     let (image_sender, mut image_receiver) = mpsc::channel::<ImageUpdate>(32);
 
     let writer_task = tokio::spawn(async move {
@@ -378,10 +462,17 @@ async fn read_device(info: DeviceInfo) {
 
     let _writer_guard = AbortOnDrop(writer_task);
 
-    *IMAGE_SENDER.lock().await = Some(image_sender);
+    *IMAGE_SENDER.lock().await = Some(image_sender.clone());
 
-    // Ask OpenDeck to send its current key images.
-    // This is an OpenDeck event, not a new HID command.
+    // Preserve the already validated black JPEG initialization.
+    // CRT CLE removes persistent display borders first.
+    // Black JPEGs then leave unassigned keys blank.
+    if let Err(error) = queue_blank_all(&image_sender).await {
+        log::error!("Initial blank image queue failed: {error}");
+    }
+
+    // Ask OpenDeck to redraw configured actions.
+    // This is an OpenDeck event, not an HID command.
     {
         let mut manager = OUTBOUND_EVENT_MANAGER.lock().await;
 
@@ -413,7 +504,6 @@ async fn read_device(info: DeviceInfo) {
             continue;
         }
 
-        // Preserve the proven button report header.
         if !report[..length].starts_with(b"ACK\0\0OK\0\0") {
             continue;
         }
@@ -579,7 +669,6 @@ mod tests {
         let jpeg = vec![0xAB; 1025];
         let reports = make_image_reports(13, &jpeg).unwrap();
 
-        // BAT + two JPEG reports + STP.
         assert_eq!(reports.len(), 4);
 
         assert_eq!(reports[0][0], 0);
@@ -609,5 +698,33 @@ mod tests {
 
         assert_eq!(result.width(), 96);
         assert_eq!(result.height(), 96);
+    }
+
+    #[tokio::test]
+    async fn blank_all_queues_18_black_images() {
+        let (sender, mut receiver) = mpsc::channel::<ImageUpdate>(KEY_COUNT);
+
+        queue_blank_all(&sender).await.unwrap();
+
+        for expected_key in OPENDECK_TO_PHYSICAL {
+            let update = receiver.try_recv().unwrap();
+
+            assert_eq!(update.physical_key, expected_key);
+
+            let image = image::load_from_memory_with_format(&update.jpeg, ImageFormat::Jpeg)
+                .unwrap()
+                .to_rgb8();
+
+            assert_eq!(image.width(), IMAGE_SIZE);
+            assert_eq!(image.height(), IMAGE_SIZE);
+
+            assert!(
+                image
+                    .pixels()
+                    .all(|pixel| { pixel.0.iter().all(|channel| *channel < 8) })
+            );
+        }
+
+        assert!(receiver.try_recv().is_err());
     }
 }
