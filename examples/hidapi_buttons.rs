@@ -95,23 +95,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             None
         };
 
-        if let Some(offset) = offset {
-            if length >= offset + 11 {
-                let key = buffer[offset + 9];
-                let state = buffer[offset + 10];
+        if let Some(offset) = offset
+            && length >= offset + 11
+        {
+            let key = buffer[offset + 9];
+            let state = buffer[offset + 10];
 
-                println!(
-                    "BUTTON: physical={key}, state={}",
-                    match state {
-                        0 => "UP",
-                        1 => "DOWN",
-                        _ => "UNKNOWN",
-                    }
-                );
-
-                if key == 13 {
-                    println!("[MATCH] OpenDeck key (0,0)");
+            println!(
+                "BUTTON: physical={key}, state={}",
+                match state {
+                    0 => "UP",
+                    1 => "DOWN",
+                    _ => "UNKNOWN",
                 }
+            );
+
+            if key == 13 {
+                println!("[MATCH] OpenDeck key (0,0)");
             }
         }
 

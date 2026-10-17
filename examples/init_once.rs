@@ -19,7 +19,6 @@ const READ_DURATION: Duration = Duration::from_secs(30);
 
 // Exact initialization commands from mirajazz.
 // Byte zero is the HID Report ID.
-
 const CRT_DIS: [u8; 9] = [0x00, 0x43, 0x52, 0x54, 0x00, 0x00, 0x44, 0x49, 0x53];
 
 const CRT_LIG: [u8; 13] = [
@@ -38,12 +37,13 @@ fn send_command(device: &HidDevice, name: &str, command: &[u8]) -> Result<(), Bo
     if written != OUTPUT_REPORT_BYTES {
         return Err(format!(
             "Incomplete HID write for {name}: \
-                 {written}/{OUTPUT_REPORT_BYTES} bytes"
+             {written}/{OUTPUT_REPORT_BYTES} bytes"
         )
         .into());
     }
 
     println!("[PASS] {name} submitted");
+
     Ok(())
 }
 
@@ -91,7 +91,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Exactly two output reports.
     // No additional HID commands are sent anywhere.
-
     send_command(&device, "CRT DIS", &CRT_DIS)?;
     send_command(&device, "CRT LIG", &CRT_LIG)?;
 
@@ -141,22 +140,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             None
         };
 
-        if let Some(offset) = offset {
-            if length >= offset + 11 {
-                let key = data[offset + 9];
-                let state = data[offset + 10];
+        if let Some(offset) = offset
+            && length >= offset + 11
+        {
+            let key = data[offset + 9];
+            let state = data[offset + 10];
 
-                let event = match state {
-                    0 => "UP",
-                    1 => "DOWN",
-                    _ => "UNKNOWN",
-                };
+            let event = match state {
+                0 => "UP",
+                1 => "DOWN",
+                _ => "UNKNOWN",
+            };
 
-                println!("BUTTON: physical={key}, state={event}");
+            println!("BUTTON: physical={key}, state={event}");
 
-                if key == 13 {
-                    println!("[MATCH] OpenDeck (0,0): {event}");
-                }
+            if key == 13 {
+                println!("[MATCH] OpenDeck (0,0): {event}");
             }
         }
 
