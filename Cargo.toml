@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 async-hid = { version = "0.5.3", default-features = false, features = ["tokio", "win32"] }
+data-url = "0.3.1"
 futures-lite = "2.6.0"
 hidapi = { version = "2.6.7", default-features = false, features = ["windows-native"] }
 image = { version = "0.25.6", default-features = false, features = ["jpeg"] }
@@ -14,4 +15,4 @@ log = "0.4.27"
 mirajazz = "0.16.2"
 openaction = "1.1.5"
 simplelog = "0.12.2"
-tokio = { version = "1.44.2", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.44.2", features = ["rt-multi-thread", "macros", "time", "sync"] }
